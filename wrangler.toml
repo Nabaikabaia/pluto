@@ -1,0 +1,16 @@
+name = "pluto"
+main = "worker.js"
+compatibility_date = "2026-06-08"
+
+# Serve static assets (for channels.json)
+[assets]
+directory = "./"
+binding = "ASSETS"
+
+# Observability
+[observability]
+enabled = true
+
+# Logging
+[logs]
+enabled = true
