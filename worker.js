@@ -1,5 +1,5 @@
 // ============================================
-// 🇺🇸 PLUTO TV API v3.2 — FIXED IMAGES
+// 🇺🇸 PLUTO TV API v3.3 — ALL PARAMS FIXED
 // Cloudflare Worker
 // ============================================
 
@@ -54,11 +54,7 @@ async function getBootData() {
   const now = Date.now();
   
   if (cachedBoot && (now - cachedBootTime) < CACHE_DURATION) {
-    return jsonResponse({
-      source: "cache",
-      expiresIn: CACHE_DURATION - (now - cachedBootTime),
-      ...cachedBoot
-    });
+    return jsonResponse({ source: "cache", expiresIn: CACHE_DURATION - (now - cachedBootTime), ...cachedBoot });
   }
 
   const clientID = crypto.randomUUID();
@@ -83,7 +79,6 @@ async function getBootData() {
   cachedBoot = {
     sessionToken: data.sessionToken,
     stitcher: data.servers?.stitcher,
-    stitcherDash: data.servers?.stitcherDash,
     stitcherParams: data.stitcherParams,
     session: data.session,
     epg: data.EPG,
@@ -96,7 +91,7 @@ async function getBootData() {
 }
 
 // ============================================
-// GET ALL CHANNELS — FIXED IMAGES
+// GET ALL CHANNELS
 // ============================================
 async function getChannels() {
   const data = await plutoFetch("/v2/channels?channelType=live");
@@ -107,10 +102,8 @@ async function getChannels() {
     number: ch.number,
     category: ch.category,
     description: ch.summary || "",
-    // FIXED: images are now at ch.thumbnail.path, ch.tile.path, ch.logo.path
     thumbnail: ch.tile?.path || ch.thumbnail?.path || "",
     logo: ch.logo?.path || ch.colorLogoPNG?.path || "",
-    featuredImage: ch.featuredImage?.path || "",
     isStitched: ch.isStitched || false,
     streamUrl: `/stream?slug=${ch.slug}`,
     nowPlaying: ch.currentBroadcast?.title || ch.currentProgram?.title || null,
@@ -125,39 +118,57 @@ async function getChannels() {
 async function getToken() {
   const boot = await getBootDataFromCache();
   if (!boot.sessionToken) return jsonResponse({ error: "No token available" }, 500);
-
   return jsonResponse({
     sessionToken: boot.sessionToken,
     expiresIn: boot.refreshInSec,
-    stitcher: boot.stitcher,
     country: boot.session?.country || "unknown",
   });
 }
 
 // ============================================
-// GET STREAM URL
+// GET STREAM URL — ALL REQUIRED PARAMS
 // ============================================
 async function getStreamUrl(params) {
   const slug = params.get("slug");
   if (!slug) return jsonResponse({ error: "Missing ?slug= parameter" }, 400);
 
-  // Get channel from API (has stitched URLs)
   const data = await plutoFetch("/v2/channels?channelType=live");
   const channels = Array.isArray(data) ? data : data.data || [];
   const channel = channels.find(ch => ch.slug === slug);
 
   if (!channel) return jsonResponse({ error: "Channel not found" }, 404);
 
-  // Use the pre-built stitched URL from the API
-  let streamUrl = "";
-  if (channel.stitched?.urls?.[0]?.url) {
-    streamUrl = channel.stitched.urls[0].url;
-  } else {
-    // Fallback: build URL manually
-    const boot = await getBootDataFromCache();
-    const stitcher = boot.stitcher || "https://cfd-v4-service-channel-stitcher-use1-1.prd.pluto.tv";
-    streamUrl = `${stitcher}/stitch/hls/channel/${channel._id}/master.m3u8?${boot.stitcherParams || ''}&deviceDNT=false`;
-  }
+  const boot = await getBootDataFromCache();
+  const stitcher = boot.stitcher || "https://cfd-v4-service-channel-stitcher-use1-1.prd.pluto.tv";
+  
+  const deviceId = crypto.randomUUID();
+  const sessionId = crypto.randomUUID();
+  const clientTime = new Date().toISOString();
+
+  const queryParams = new URLSearchParams({
+    advertisingId: "",
+    appName: "web",
+    appVersion: "9.21.0-bf9f5b4369933742859f3b2581c935110922f642",
+    architecture: "",
+    buildVersion: "",
+    clientTime: clientTime,
+    deviceDNT: "0",
+    deviceId: deviceId,
+    deviceLat: "34.0522",
+    deviceLon: "-118.2437",
+    deviceMake: "chrome",
+    deviceModel: "web",
+    deviceType: "web",
+    deviceVersion: "148.0.7778",
+    includeExtendedEvents: "false",
+    marketingRegion: "US",
+    serverSideAds: "false",
+    sid: sessionId,
+    sessionID: sessionId,
+    userId: "",
+  });
+
+  const streamUrl = `${stitcher}/stitch/hls/channel/${channel._id}/master.m3u8?${queryParams.toString()}`;
 
   return jsonResponse({
     channel: channel.name,
@@ -192,7 +203,6 @@ async function getChannel(params) {
       description: ch.summary || "",
       thumbnail: ch.tile?.path || ch.thumbnail?.path || "",
       logo: ch.logo?.path || ch.colorLogoPNG?.path || "",
-      featuredImage: ch.featuredImage?.path || "",
       isStitched: ch.isStitched || false,
     },
     streamUrl: `/stream?slug=${ch.slug}`,
@@ -265,7 +275,7 @@ async function searchChannels(query) {
 }
 
 // ============================================
-// GET BOOT FROM CACHE (INTERNAL)
+// INTERNAL HELPERS
 // ============================================
 async function getBootDataFromCache() {
   const now = Date.now();
@@ -294,7 +304,6 @@ async function getBootDataFromCache() {
   cachedBoot = {
     sessionToken: data.sessionToken,
     stitcher: data.servers?.stitcher,
-    stitcherDash: data.servers?.stitcherDash,
     stitcherParams: data.stitcherParams,
     session: data.session,
     epg: data.EPG,
@@ -306,9 +315,6 @@ async function getBootDataFromCache() {
   return cachedBoot;
 }
 
-// ============================================
-// SHARED FETCH
-// ============================================
 async function plutoFetch(endpoint) {
   const response = await fetch(`https://api.pluto.tv${endpoint}`, {
     cf: { colo: "LAX" },
@@ -322,28 +328,22 @@ async function plutoFetch(endpoint) {
   return response.json();
 }
 
-// ============================================
-// API DOCS
-// ============================================
 function apiDocs() {
   return jsonResponse({
-    service: "Pluto TV API v3.2",
+    service: "Pluto TV API v3.3",
     endpoints: {
-      "/boot": "Boot data (token, stitcher, EPG) — cached 7hrs",
+      "/boot": "Boot data — cached 7hrs",
       "/token": "JWT session token",
-      "/channels": "All live channels with thumbnails",
-      "/channel?slug=cnn": "Single channel details",
+      "/channels": "All live channels",
+      "/channel?slug=cnn": "Channel details",
       "/categories": "All categories",
       "/epg": "Program guide",
-      "/search?q=comedy": "Search channels",
-      "/stream?slug=cnn": "Stream URL",
+      "/search?q=comedy": "Search",
+      "/stream?slug=cnn": "Stream URL with all params",
     }
   });
 }
 
-// ============================================
-// HELPERS
-// ============================================
 function jsonResponse(data, status = 200, maxAge = 60) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
