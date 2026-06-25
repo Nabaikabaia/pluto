@@ -1,5 +1,5 @@
 // ============================================
-// 🇺🇸 PLUTO TV API v3.7 — RELATIVE PATH FIX
+// 🇺🇸 PLUTO TV API v3.8 — FULL EPG FIX
 // Cloudflare Worker
 // ============================================
 
@@ -96,36 +96,19 @@ a{color:#fff;background:#e50914;padding:12px 24px;border-radius:8px;text-decorat
     script.src = 'https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js';
     script.onload = function() {
       if (typeof Hls === 'undefined') { fail('hls.js failed'); return; }
-      
-      const h = new Hls({ 
-        debug: false,
-        manifestLoadPolicy: { default: { maxTimeToFirstByteMs: 15000, maxLoadTimeMs: 30000 } }
-      });
-      
+      const h = new Hls({ debug: false });
       h.loadSource(url);
       h.attachMedia(v);
-      
       h.on(Hls.Events.MANIFEST_PARSED, function() {
-        s.style.display = 'none';
-        v.style.display = 'block';
-        c.style.display = 'block';
+        s.style.display = 'none'; v.style.display = 'block'; c.style.display = 'block';
         v.play().catch(function() { s.style.display = 'none'; });
       });
-      
       h.on(Hls.Events.ERROR, function(event, data) {
         console.error('HLS:', data.type, data.details);
         if (data.fatal) {
-          switch(data.type) {
-            case Hls.ErrorTypes.NETWORK_ERROR:
-              fail('Network error');
-              break;
-            case Hls.ErrorTypes.MEDIA_ERROR:
-              h.recoverMediaError();
-              break;
-            default:
-              fail('Error: ' + data.details);
-              break;
-          }
+          if(data.type === Hls.ErrorTypes.NETWORK_ERROR) fail('Network error');
+          else if(data.type === Hls.ErrorTypes.MEDIA_ERROR) h.recoverMediaError();
+          else fail('Error: ' + data.details);
         }
       });
     };
@@ -137,9 +120,7 @@ a{color:#fff;background:#e50914;padding:12px 24px;border-radius:8px;text-decorat
     v.src = url;
     v.addEventListener('loadedmetadata', function() { s.style.display = 'none'; v.style.display = 'block'; c.style.display = 'block'; });
     v.addEventListener('error', function() { fail('Video failed'); });
-  } else {
-    loadHlsJS();
-  }
+  } else { loadHlsJS(); }
 })();
 </script>
 </body>
@@ -203,7 +184,9 @@ async function getChannels() {
     logo: ch.logo?.path || "",
     playUrl: `/play?slug=${ch.slug}`,
     watchUrl: `/watch?slug=${ch.slug}`,
-    nowPlaying: ch.currentBroadcast?.title || null,
+    nowPlaying: ch.currentBroadcast?.title || ch.currentProgram?.title || null,
+    startTime: ch.currentBroadcast?.start || ch.currentProgram?.start || null,
+    endTime: ch.currentBroadcast?.stop || ch.currentProgram?.stop || null,
   }));
   return jsonResponse({ total: channels.length, channels }, 200, 300);
 }
@@ -238,23 +221,19 @@ async function getStreamUrl(params) {
     watchUrl: `/watch?slug=${ch.slug}`,
     thumbnail: ch.tile?.path || "",
     logo: ch.logo?.path || "",
+    nowPlaying: ch.currentBroadcast?.title || ch.currentProgram?.title || null,
   });
 }
 
 // ============================================
-// 🎬 STREAM PROXY — FIXED RELATIVE PATHS
+// 🎬 STREAM PROXY
 // ============================================
 async function proxyStream(url, request) {
   const slug = url.searchParams.get("slug");
   const directUrl = url.searchParams.get("url");
 
-  if (directUrl) {
-    return proxyMediaFile(directUrl, request);
-  }
-
-  if (!slug) {
-    return jsonResponse({ error: "Missing ?slug= or ?url=" }, 400);
-  }
+  if (directUrl) return proxyMediaFile(directUrl, request);
+  if (!slug) return jsonResponse({ error: "Missing ?slug= or ?url=" }, 400);
 
   const data = await plutoFetch("/v2/channels?channelType=live");
   const channels = Array.isArray(data) ? data : data.data || [];
@@ -270,9 +249,7 @@ async function proxyStream(url, request) {
     headers: getStitcherHeaders(),
   });
 
-  if (!response.ok) {
-    return new Response(`Stream error: ${response.status}`, { status: response.status });
-  }
+  if (!response.ok) return new Response(`Stream error: ${response.status}`, { status: response.status });
 
   let text = await response.text();
 
@@ -281,33 +258,24 @@ async function proxyStream(url, request) {
   text = text.replace(/(https?:\/\/[^\s"'<>]+\.ts[^\s"'<>]*)/gi, m => `${baseUrl}/play?url=${encodeURIComponent(m)}`);
   text = text.replace(/(https?:\/\/[^\s"'<>]+\.key[^\s"'<>]*)/gi, m => `${baseUrl}/play?url=${encodeURIComponent(m)}`);
 
-  // Rewrite RELATIVE paths to sub-playlists (e.g. "1042180/playlist.m3u8?...")
-  text = text.replace(/^((?!https?:\/\/)(?!\#)[^\s"'<>]+\.m3u8[^\s"'<>]*)/gim,
-    (match) => {
-      const fullUrl = `${masterBase}/${match}`;
-      return `${baseUrl}/play?url=${encodeURIComponent(fullUrl)}`;
-    }
-  );
+  // Rewrite RELATIVE paths
+  text = text.replace(/^((?!https?:\/\/)(?!\#)[^\s"'<>]+\.m3u8[^\s"'<>]*)/gim, match => {
+    const fullUrl = `${masterBase}/${match}`;
+    return `${baseUrl}/play?url=${encodeURIComponent(fullUrl)}`;
+  });
 
-  // Rewrite URI= attributes with relative paths
-  text = text.replace(/URI="((?!https?:\/\/)[^"]+)"/gi,
-    (match, path) => {
-      const fullUrl = `${masterBase}/${path}`;
-      return `URI="${baseUrl}/play?url=${encodeURIComponent(fullUrl)}"`;
-    }
-  );
+  text = text.replace(/URI="((?!https?:\/\/)[^"]+)"/gi, (match, path) => {
+    const fullUrl = `${masterBase}/${path}`;
+    return `URI="${baseUrl}/play?url=${encodeURIComponent(fullUrl)}"`;
+  });
 
   return new Response(text, {
-    headers: {
-      "Content-Type": "application/vnd.apple.mpegurl",
-      "Access-Control-Allow-Origin": "*",
-      "Cache-Control": "no-cache",
-    }
+    headers: { "Content-Type": "application/vnd.apple.mpegurl", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache" }
   });
 }
 
 // ============================================
-// PROXY MEDIA FILES — FIXED RELATIVE PATHS
+// PROXY MEDIA FILES
 // ============================================
 async function proxyMediaFile(targetUrl, request) {
   const response = await fetch(targetUrl, {
@@ -315,9 +283,7 @@ async function proxyMediaFile(targetUrl, request) {
     headers: getStitcherHeaders(),
   });
 
-  if (!response.ok) {
-    return new Response(`Error: ${response.status}`, { status: response.status });
-  }
+  if (!response.ok) return new Response(`Error: ${response.status}`, { status: response.status });
 
   const body = await response.arrayBuffer();
   let ct = response.headers.get("content-type") || "";
@@ -330,61 +296,40 @@ async function proxyMediaFile(targetUrl, request) {
   if (targetUrl.includes(".m3u8") || ct.includes("mpegurl")) {
     const baseUrl = new URL(request.url).origin;
     const targetBase = targetUrl.replace(/\/[^\/]+\.m3u8.*$/, '');
-    
     let text = new TextDecoder().decode(body);
 
-    // Rewrite absolute URLs
     text = text.replace(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/gi, m => `${baseUrl}/play?url=${encodeURIComponent(m)}`);
     text = text.replace(/(https?:\/\/[^\s"'<>]+\.ts[^\s"'<>]*)/gi, m => `${baseUrl}/play?url=${encodeURIComponent(m)}`);
     text = text.replace(/(https?:\/\/[^\s"'<>]+\.key[^\s"'<>]*)/gi, m => `${baseUrl}/play?url=${encodeURIComponent(m)}`);
 
-    // Rewrite RELATIVE paths to sub-playlists
-    text = text.replace(/^((?!https?:\/\/)(?!\#)[^\s"'<>]+\.m3u8[^\s"'<>]*)/gim,
-      (match) => {
-        const fullUrl = `${targetBase}/${match}`;
-        return `${baseUrl}/play?url=${encodeURIComponent(fullUrl)}`;
-      }
-    );
+    text = text.replace(/^((?!https?:\/\/)(?!\#)[^\s"'<>]+\.m3u8[^\s"'<>]*)/gim, match => {
+      const fullUrl = `${targetBase}/${match}`;
+      return `${baseUrl}/play?url=${encodeURIComponent(fullUrl)}`;
+    });
 
-    // Rewrite RELATIVE .ts segments
-    text = text.replace(/^((?!https?:\/\/)(?!\#)[^\s"'<>]+\.ts[^\s"'<>]*)/gim,
-      (match) => {
-        const fullUrl = `${targetBase}/${match}`;
-        return `${baseUrl}/play?url=${encodeURIComponent(fullUrl)}`;
-      }
-    );
+    text = text.replace(/^((?!https?:\/\/)(?!\#)[^\s"'<>]+\.ts[^\s"'<>]*)/gim, match => {
+      const fullUrl = `${targetBase}/${match}`;
+      return `${baseUrl}/play?url=${encodeURIComponent(fullUrl)}`;
+    });
 
-    // Rewrite URI= attributes with relative paths
-    text = text.replace(/URI="((?!https?:\/\/)[^"]+)"/gi,
-      (match, path) => {
-        const fullUrl = `${targetBase}/${path}`;
-        return `URI="${baseUrl}/play?url=${encodeURIComponent(fullUrl)}"`;
-      }
-    );
+    text = text.replace(/URI="((?!https?:\/\/)[^"]+)"/gi, (match, path) => {
+      const fullUrl = `${targetBase}/${path}`;
+      return `URI="${baseUrl}/play?url=${encodeURIComponent(fullUrl)}"`;
+    });
 
     const enc = new TextEncoder().encode(text);
     return new Response(enc, {
-      headers: {
-        "Content-Type": "application/vnd.apple.mpegurl",
-        "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "no-cache",
-        "Content-Length": enc.byteLength
-      }
+      headers: { "Content-Type": "application/vnd.apple.mpegurl", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache", "Content-Length": enc.byteLength }
     });
   }
 
   return new Response(body, {
-    headers: {
-      "Content-Type": ct,
-      "Access-Control-Allow-Origin": "*",
-      "Cache-Control": "public, max-age=10",
-      "Content-Length": body.byteLength
-    }
+    headers: { "Content-Type": ct, "Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=10", "Content-Length": body.byteLength }
   });
 }
 
 // ============================================
-// OTHER ENDPOINTS
+// GET SINGLE CHANNEL
 // ============================================
 async function getChannel(params) {
   const slug = params.get("slug");
@@ -398,10 +343,13 @@ async function getChannel(params) {
     category: ch.category, description: ch.summary || "",
     thumbnail: ch.tile?.path || "", logo: ch.logo?.path || "",
     playUrl: `/play?slug=${ch.slug}`, watchUrl: `/watch?slug=${ch.slug}`,
-    nowPlaying: ch.currentBroadcast?.title || null,
+    nowPlaying: ch.currentBroadcast?.title || ch.currentProgram?.title || null,
   }, 200, 60);
 }
 
+// ============================================
+// GET CATEGORIES
+// ============================================
 async function getCategories() {
   const data = await plutoFetch("/v2/channels?channelType=live");
   const channels = Array.isArray(data) ? data : data.data || [];
@@ -409,17 +357,41 @@ async function getCategories() {
   return jsonResponse({ total: cats.length, categories: cats }, 200, 600);
 }
 
+// ============================================
+// 🆕 GET EPG — FROM CHANNELS API
+// ============================================
 async function getEPG() {
-  const boot = await getBootDataFromCache();
-  if (!boot.epg?.length) return jsonResponse({ error: "No EPG" }, 404);
-  const programs = boot.epg.flatMap(ch => (ch.timelines || []).map(t => ({
-    channelName: ch.name, channelSlug: ch.slug, channelNumber: ch.number,
-    title: t.title, startTime: t.start, endTime: t.stop,
-    genre: t.episode?.genre, rating: t.episode?.rating, description: t.episode?.description,
-  })));
+  const data = await plutoFetch("/v2/channels?channelType=live");
+  const channels = Array.isArray(data) ? data : data.data || [];
+
+  const programs = channels
+    .filter(ch => ch.currentBroadcast || ch.currentProgram)
+    .map(ch => {
+      const broadcast = ch.currentBroadcast || ch.currentProgram || {};
+      return {
+        channelName: ch.name,
+        channelSlug: ch.slug,
+        channelNumber: ch.number,
+        category: ch.category,
+        title: broadcast.title || "No program data",
+        startTime: broadcast.start || null,
+        endTime: broadcast.stop || null,
+        genre: broadcast.genre || ch.category,
+        rating: broadcast.rating || null,
+        description: broadcast.description || ch.summary || "",
+        thumbnail: ch.tile?.path || ch.thumbnail?.path || "",
+        playUrl: `/play?slug=${ch.slug}`,
+        watchUrl: `/watch?slug=${ch.slug}`,
+      };
+    })
+    .sort((a, b) => (a.channelNumber || 999) - (b.channelNumber || 999));
+
   return jsonResponse({ total: programs.length, programs }, 200, 120);
 }
 
+// ============================================
+// SEARCH
+// ============================================
 async function searchChannels(query) {
   if (!query) return jsonResponse({ error: "Missing ?q=" }, 400);
   const data = await plutoFetch("/v2/channels?channelType=live");
@@ -429,6 +401,7 @@ async function searchChannels(query) {
     id: c._id, name: c.name, slug: c.slug, number: c.number, category: c.category,
     thumbnail: c.tile?.path || "", logo: c.logo?.path || "",
     playUrl: `/play?slug=${c.slug}`, watchUrl: `/watch?slug=${c.slug}`,
+    nowPlaying: c.currentBroadcast?.title || c.currentProgram?.title || null,
   }));
   return jsonResponse({ query, total: results.length, results }, 200, 120);
 }
@@ -486,13 +459,13 @@ async function plutoFetch(endpoint) {
 
 function apiDocs() {
   return jsonResponse({
-    service: "Pluto TV API v3.7 🎬",
+    service: "Pluto TV API v3.8 🎬",
     endpoints: {
-      "/channels": "All live channels",
+      "/channels": "All 200+ live channels with now-playing",
       "/channel?slug=cnn": "Channel details",
       "/categories": "Categories",
-      "/epg": "Program guide",
-      "/search?q=comedy": "Search",
+      "/epg": "Full program guide (all channels)",
+      "/search?q=comedy": "Search channels",
       "/stream?slug=cnn": "Stream URL",
       "/play?slug=cnn": "Proxied m3u8 (VLC)",
       "/watch?slug=cnn": "Web player",
