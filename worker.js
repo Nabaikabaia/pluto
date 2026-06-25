@@ -1,11 +1,11 @@
 // ============================================
-// 🇺🇸 PLUTO TV API v3.0 — BOOT API POWERED
+// 🇺🇸 PLUTO TV API v3.1 — ALL CHANNELS FIX
 // Cloudflare Worker
 // ============================================
 
 let cachedBoot = null;
 let cachedBootTime = 0;
-const CACHE_DURATION = 7 * 60 * 60 * 1000; // 7 hours
+const CACHE_DURATION = 7 * 60 * 60 * 1000;
 
 export default {
   async fetch(request) {
@@ -48,7 +48,7 @@ export default {
 };
 
 // ============================================
-// GET BOOT DATA (CACHED)
+// GET BOOT DATA (NO CHANNELSLUG — GET ALL)
 // ============================================
 async function getBootData() {
   const now = Date.now();
@@ -62,9 +62,9 @@ async function getBootData() {
   }
 
   const clientID = crypto.randomUUID();
-  const sessionID = crypto.randomUUID();
   const timestamp = new Date().toISOString();
 
+  // REMOVED channelSlug — now returns ALL channels
   const bootUrl = `https://boot.pluto.tv/v4/start?appName=web&appVersion=9.21.0-bf9f5b4369933742859f3b2581c935110922f642&deviceVersion=148.0.7778&deviceModel=web&deviceMake=chrome&deviceType=web&clientID=${clientID}&clientModelNumber=1.0.0&serverSideAds=false&clientTime=${encodeURIComponent(timestamp)}`;
 
   const response = await fetch(bootUrl, {
@@ -83,7 +83,6 @@ async function getBootData() {
 
   const data = await response.json();
 
-  // Cache it
   cachedBoot = {
     sessionToken: data.sessionToken,
     stitcher: data.servers?.stitcher,
@@ -104,7 +103,30 @@ async function getBootData() {
 }
 
 // ============================================
-// GET JWT TOKEN ONLY
+// GET ALL CHANNELS — ALWAYS FROM API, NOT EPG
+// ============================================
+async function getChannels() {
+  // Always use the real API for channel listings
+  const data = await plutoFetch("/v2/channels?channelType=live");
+  const channels = (Array.isArray(data) ? data : data.data || []).map(ch => ({
+    id: ch._id,
+    name: ch.name,
+    slug: ch.slug,
+    number: ch.number,
+    category: ch.category,
+    description: ch.summary || "",
+    thumbnail: ch.images?.thumbnail?.url || ch.tileImage?.url || "",
+    logo: ch.images?.logo?.url || "",
+    isStitched: ch.isStitched || false,
+    streamUrl: `/stream?slug=${ch.slug}`,
+    nowPlaying: ch.currentBroadcast?.title || ch.currentProgram?.title || null,
+  }));
+
+  return jsonResponse({ total: channels.length, channels }, 200, 300);
+}
+
+// ============================================
+// GET TOKEN
 // ============================================
 async function getToken() {
   const boot = await getBootDataFromCache();
@@ -117,62 +139,156 @@ async function getToken() {
     sessionToken: boot.sessionToken,
     expiresIn: boot.refreshInSec,
     stitcher: boot.stitcher,
-    note: "Use this token in Authorization: Bearer header for stream requests"
+    country: boot.session?.country || "unknown",
+    note: "Use this token for stream requests"
   });
 }
 
 // ============================================
-// GET STREAM URL WITH VALID TOKEN
+// GET STREAM URL
 // ============================================
 async function getStreamUrl(params) {
   const slug = params.get("slug");
   if (!slug) return jsonResponse({ error: "Missing ?slug= parameter" }, 400);
 
-  // Get boot data (with token and EPG)
   const boot = await getBootDataFromCache();
   
   if (!boot.sessionToken) {
     return jsonResponse({ error: "No session token. Hit /boot first." }, 500);
   }
 
-  // Find channel in EPG
+  // Try EPG first
   const channel = boot.epg?.find(ch => ch.slug === slug);
   
-  if (!channel) {
-    // Fallback: search API
-    const data = await plutoFetch("/v2/channels?channelType=live");
-    const channels = Array.isArray(data) ? data : data.data || [];
-    const found = channels.find(ch => ch.slug === slug);
-    
-    if (!found) return jsonResponse({ error: "Channel not found" }, 404);
-
-    // Build stream URL using boot data
+  if (channel) {
     const stitcher = boot.stitcher || "https://cfd-v4-service-channel-stitcher-use1-1.prd.pluto.tv";
-    const streamUrl = `${stitcher}${found.stitched?.path || `/stitch/hls/channel/${found._id}/master.m3u8`}?${boot.stitcherParams || ''}`;
+    const streamUrl = `${stitcher}${channel.stitched.path}?${boot.stitcherParams || ''}&deviceDNT=false`;
 
     return jsonResponse({
-      channel: found.name,
-      slug: found.slug,
+      channel: channel.name,
+      slug: channel.slug,
+      number: channel.number,
       streamUrl: streamUrl,
       token: boot.sessionToken,
-      stitcher: stitcher,
-      note: "Use VPN + this URL in VLC. Token valid for 8 hours."
+      nowPlaying: channel.timelines?.[0]?.title || "Unknown",
+      timeline: channel.timelines?.slice(0, 5).map(t => ({
+        title: t.title,
+        start: t.start,
+        end: t.stop,
+      })),
     });
   }
 
-  // Use EPG data
+  // Fallback: search API
+  const data = await plutoFetch("/v2/channels?channelType=live");
+  const channels = Array.isArray(data) ? data : data.data || [];
+  const found = channels.find(ch => ch.slug === slug);
+  
+  if (!found) return jsonResponse({ error: "Channel not found" }, 404);
+
   const stitcher = boot.stitcher || "https://cfd-v4-service-channel-stitcher-use1-1.prd.pluto.tv";
-  const streamUrl = `${stitcher}${channel.stitched.path}?${boot.stitcherParams || ''}`;
+  const streamUrl = `${stitcher}/stitch/hls/channel/${found._id}/master.m3u8?${boot.stitcherParams || ''}&deviceDNT=false`;
 
   return jsonResponse({
-    channel: channel.name,
-    slug: channel.slug,
+    channel: found.name,
+    slug: found.slug,
     streamUrl: streamUrl,
     token: boot.sessionToken,
-    stitcher: stitcher,
-    timeline: channel.timelines,
-    note: "Use VPN + this URL in VLC. Token embedded in URL params."
   });
+}
+
+// ============================================
+// GET SINGLE CHANNEL
+// ============================================
+async function getChannel(params) {
+  const slug = params.get("slug");
+  if (!slug) return jsonResponse({ error: "Missing ?slug= parameter" }, 400);
+
+  // Always use API for reliable channel data
+  const data = await plutoFetch("/v2/channels?channelType=live");
+  const channels = Array.isArray(data) ? data : data.data || [];
+  const ch = channels.find(c => c.slug === slug);
+
+  if (!ch) return jsonResponse({ error: "Channel not found" }, 404);
+
+  return jsonResponse({
+    channel: {
+      id: ch._id,
+      name: ch.name,
+      slug: ch.slug,
+      number: ch.number,
+      category: ch.category,
+      description: ch.summary || "",
+      thumbnail: ch.images?.thumbnail?.url || ch.tileImage?.url || "",
+      logo: ch.images?.logo?.url || "",
+      isStitched: ch.isStitched || false,
+    },
+    streamUrl: `/stream?slug=${ch.slug}`,
+    nowPlaying: ch.currentBroadcast?.title || ch.currentProgram?.title || null,
+  }, 200, 60);
+}
+
+// ============================================
+// GET CATEGORIES
+// ============================================
+async function getCategories() {
+  const data = await plutoFetch("/v2/channels?channelType=live");
+  const channels = Array.isArray(data) ? data : data.data || [];
+  const categories = [...new Set(channels.map(ch => ch.category))].sort();
+  return jsonResponse({ total: categories.length, categories }, 200, 600);
+}
+
+// ============================================
+// GET EPG
+// ============================================
+async function getEPG() {
+  const boot = await getBootDataFromCache();
+  
+  if (boot.epg && boot.epg.length > 0) {
+    const programs = boot.epg.flatMap(ch => 
+      (ch.timelines || []).map(t => ({
+        channelName: ch.name,
+        channelSlug: ch.slug,
+        channelNumber: ch.number,
+        title: t.title,
+        startTime: t.start,
+        endTime: t.stop,
+        genre: t.episode?.genre,
+        rating: t.episode?.rating,
+        description: t.episode?.description,
+      }))
+    );
+    return jsonResponse({ total: programs.length, programs }, 200, 120);
+  }
+
+  return jsonResponse({ error: "No EPG data" }, 404);
+}
+
+// ============================================
+// SEARCH
+// ============================================
+async function searchChannels(query) {
+  if (!query) return jsonResponse({ error: "Missing ?q= parameter" }, 400);
+
+  const data = await plutoFetch("/v2/channels?channelType=live");
+  const channels = Array.isArray(data) ? data : data.data || [];
+  const q = query.toLowerCase();
+
+  const results = channels.filter(ch =>
+    ch.name?.toLowerCase().includes(q) ||
+    ch.category?.toLowerCase().includes(q) ||
+    ch.summary?.toLowerCase().includes(q)
+  ).slice(0, 30).map(ch => ({
+    id: ch._id,
+    name: ch.name,
+    slug: ch.slug,
+    number: ch.number,
+    category: ch.category,
+    thumbnail: ch.images?.thumbnail?.url || ch.tileImage?.url || "",
+    streamUrl: `/stream?slug=${ch.slug}`,
+  }));
+
+  return jsonResponse({ query, total: results.length, results }, 200, 120);
 }
 
 // ============================================
@@ -218,159 +334,6 @@ async function getBootDataFromCache() {
 }
 
 // ============================================
-// GET ALL CHANNELS (FROM EPG)
-// ============================================
-async function getChannels() {
-  const boot = await getBootDataFromCache();
-  
-  if (boot.epg) {
-    const channels = boot.epg.map(ch => ({
-      id: ch.id,
-      name: ch.name,
-      slug: ch.slug,
-      number: ch.number,
-      isStitched: ch.isStitched,
-      thumbnail: ch.images?.find(i => i.type === "tileColor")?.url || "",
-      logo: ch.images?.find(i => i.type === "colorLogoPNG")?.url || "",
-      streamUrl: `/stream?slug=${ch.slug}`,
-      nowPlaying: ch.timelines?.[0]?.title || "Unknown",
-    }));
-    return jsonResponse({ total: channels.length, source: "boot-epg", channels }, 200, 300);
-  }
-
-  // Fallback to API
-  const data = await plutoFetch("/v2/channels?channelType=live");
-  const channels = (Array.isArray(data) ? data : data.data || []).map(ch => ({
-    id: ch._id,
-    name: ch.name,
-    slug: ch.slug,
-    number: ch.number,
-    category: ch.category,
-    isStitched: ch.isStitched || false,
-    streamUrl: `/stream?slug=${ch.slug}`,
-  }));
-
-  return jsonResponse({ total: channels.length, source: "api", channels }, 200, 300);
-}
-
-// ============================================
-// GET SINGLE CHANNEL
-// ============================================
-async function getChannel(params) {
-  const slug = params.get("slug");
-  if (!slug) return jsonResponse({ error: "Missing ?slug= parameter" }, 400);
-
-  const boot = await getBootDataFromCache();
-  
-  if (boot.epg) {
-    const ch = boot.epg.find(c => c.slug === slug);
-    if (ch) {
-      return jsonResponse({
-        channel: {
-          id: ch.id,
-          name: ch.name,
-          slug: ch.slug,
-          number: ch.number,
-          isStitched: ch.isStitched,
-          thumbnail: ch.images?.find(i => i.type === "tileColor")?.url || "",
-          logo: ch.images?.find(i => i.type === "colorLogoPNG")?.url || "",
-        },
-        streamUrl: `/stream?slug=${ch.slug}`,
-        timeline: ch.timelines,
-      }, 200, 60);
-    }
-  }
-
-  return jsonResponse({ error: "Channel not found" }, 404);
-}
-
-// ============================================
-// GET CATEGORIES
-// ============================================
-async function getCategories() {
-  const boot = await getBootDataFromCache();
-  
-  if (boot.epg) {
-    const categoryIDs = boot.epg.flatMap(ch => ch.categoryIDs || []);
-    const unique = [...new Set(categoryIDs)].sort();
-    return jsonResponse({ total: unique.length, categories: unique, source: "boot-epg" }, 200, 600);
-  }
-
-  const data = await plutoFetch("/v2/channels?channelType=live");
-  const channels = Array.isArray(data) ? data : data.data || [];
-  const categories = [...new Set(channels.map(ch => ch.category))].sort();
-  return jsonResponse({ total: categories.length, categories, source: "api" }, 200, 600);
-}
-
-// ============================================
-// GET EPG
-// ============================================
-async function getEPG() {
-  const boot = await getBootDataFromCache();
-  
-  if (boot.epg) {
-    const programs = boot.epg.flatMap(ch => 
-      (ch.timelines || []).map(t => ({
-        channelName: ch.name,
-        channelSlug: ch.slug,
-        channelNumber: ch.number,
-        title: t.title,
-        startTime: t.start,
-        endTime: t.stop,
-        episodeId: t.episode?._id,
-        genre: t.episode?.genre,
-        rating: t.episode?.rating,
-        description: t.episode?.description,
-      }))
-    );
-    return jsonResponse({ total: programs.length, programs, source: "boot-epg" }, 200, 120);
-  }
-
-  return jsonResponse({ error: "No EPG data" }, 404);
-}
-
-// ============================================
-// SEARCH
-// ============================================
-async function searchChannels(query) {
-  if (!query) return jsonResponse({ error: "Missing ?q= parameter" }, 400);
-
-  const boot = await getBootDataFromCache();
-  const q = query.toLowerCase();
-
-  if (boot.epg) {
-    const results = boot.epg.filter(ch =>
-      ch.name?.toLowerCase().includes(q) ||
-      ch.timelines?.some(t => t.title?.toLowerCase().includes(q))
-    ).slice(0, 30).map(ch => ({
-      id: ch.id,
-      name: ch.name,
-      slug: ch.slug,
-      number: ch.number,
-      thumbnail: ch.images?.find(i => i.type === "tileColor")?.url || "",
-      nowPlaying: ch.timelines?.[0]?.title || "Unknown",
-      streamUrl: `/stream?slug=${ch.slug}`,
-    }));
-
-    return jsonResponse({ query, total: results.length, results, source: "boot-epg" }, 200, 120);
-  }
-
-  const data = await plutoFetch("/v2/channels?channelType=live");
-  const channels = Array.isArray(data) ? data : data.data || [];
-  const results = channels.filter(ch =>
-    ch.name?.toLowerCase().includes(q) || ch.category?.toLowerCase().includes(q)
-  ).slice(0, 30).map(ch => ({
-    id: ch._id,
-    name: ch.name,
-    slug: ch.slug,
-    number: ch.number,
-    streamUrl: `/stream?slug=${ch.slug}`,
-  }));
-
-  return jsonResponse({ query, total: results.length, results, source: "api" }, 200, 120);
-}
-
-// ============================================
 // SHARED FETCH
 // ============================================
 async function plutoFetch(endpoint) {
@@ -391,22 +354,16 @@ async function plutoFetch(endpoint) {
 // ============================================
 function apiDocs() {
   return jsonResponse({
-    service: "Pluto TV API v3.0 — Boot API Powered 🇺🇸",
+    service: "Pluto TV API v3.1",
     endpoints: {
       "/boot": "Get boot data (token, stitcher, EPG) — cached 7 hours",
       "/token": "Get valid JWT session token",
-      "/channels": "All channels from EPG",
-      "/channel?slug=pluto-tv-spotlight": "Channel details + timeline",
-      "/categories": "All category IDs",
-      "/epg": "Full program guide",
+      "/channels": "All 800+ live channels from API",
+      "/channel?slug=cnn": "Channel details",
+      "/categories": "All categories",
+      "/epg": "Program guide from boot API",
       "/search?q=comedy": "Search channels",
-      "/stream?slug=pluto-tv-spotlight": "Get stream URL with valid token",
-    },
-    usage: {
-      step1: "GET /token → get sessionToken",
-      step2: "GET /stream?slug=channel → get stream URL",
-      step3: "Open stream URL in VLC with US VPN",
-      note: "Token valid for 8 hours from boot"
+      "/stream?slug=pluto-tv-spotlight": "Get stream URL",
     }
   });
 }
