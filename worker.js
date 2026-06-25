@@ -1,5 +1,5 @@
 // ============================================
-// 🇺🇸 PLUTO TV API v3.3 — ALL PARAMS FIXED
+// 🇺🇸 PLUTO TV API v3.4 — HEADER + PARAM FIX
 // Cloudflare Worker
 // ============================================
 
@@ -126,7 +126,7 @@ async function getToken() {
 }
 
 // ============================================
-// GET STREAM URL — ALL REQUIRED PARAMS
+// GET STREAM URL — TEST THE URL FROM WORKER
 // ============================================
 async function getStreamUrl(params) {
   const slug = params.get("slug");
@@ -152,7 +152,7 @@ async function getStreamUrl(params) {
     architecture: "",
     buildVersion: "",
     clientTime: clientTime,
-    deviceDNT: "0",
+    deviceDNT: "false",
     deviceId: deviceId,
     deviceLat: "34.0522",
     deviceLon: "-118.2437",
@@ -170,6 +170,36 @@ async function getStreamUrl(params) {
 
   const streamUrl = `${stitcher}/stitch/hls/channel/${channel._id}/master.m3u8?${queryParams.toString()}`;
 
+  // TEST: Actually fetch the m3u8 from the Worker
+  let testResult = null;
+  try {
+    const testResponse = await fetch(streamUrl, {
+      cf: { colo: "LAX" },
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Origin": "https://pluto.tv",
+        "Referer": "https://pluto.tv/",
+        "plutotv-device-dnt": "false",
+        "plutotv-device-model": "web",
+        "plutotv-device-make": "chrome",
+        "plutotv-device-type": "web",
+        "plutotv-device-version": "148.0.7778",
+        "plutotv-app-name": "web",
+        "plutotv-app-version": "9.21.0",
+      }
+    });
+    const responseText = await testResponse.text();
+    testResult = {
+      status: testResponse.status,
+      contentType: testResponse.headers.get("content-type"),
+      bodyStart: responseText.slice(0, 500),
+      isM3U8: responseText.startsWith("#EXTM3U"),
+    };
+  } catch (e) {
+    testResult = { error: e.message };
+  }
+
   return jsonResponse({
     channel: channel.name,
     slug: channel.slug,
@@ -178,6 +208,10 @@ async function getStreamUrl(params) {
     thumbnail: channel.tile?.path || channel.thumbnail?.path || "",
     logo: channel.logo?.path || "",
     nowPlaying: channel.currentBroadcast?.title || channel.currentProgram?.title || null,
+    test: testResult,
+    note: testResult?.isM3U8 
+      ? "✅ STREAM WORKS! Copy streamUrl and open in VLC with US VPN." 
+      : "❌ Still blocked — see test result for error details"
   });
 }
 
@@ -330,7 +364,7 @@ async function plutoFetch(endpoint) {
 
 function apiDocs() {
   return jsonResponse({
-    service: "Pluto TV API v3.3",
+    service: "Pluto TV API v3.4",
     endpoints: {
       "/boot": "Boot data — cached 7hrs",
       "/token": "JWT session token",
@@ -339,7 +373,7 @@ function apiDocs() {
       "/categories": "All categories",
       "/epg": "Program guide",
       "/search?q=comedy": "Search",
-      "/stream?slug=cnn": "Stream URL with all params",
+      "/stream?slug=cnn": "Stream URL + test result",
     }
   });
 }
