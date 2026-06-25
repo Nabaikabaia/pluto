@@ -1,6 +1,6 @@
 // ============================================
-// PLUTO TV PROXY RELAY v2 — STRICT US FILTER
-// Deploy on Render, Region: US
+// PLUTO TV PROXY RELAY v3 — DIRECT FALLBACK
+// Deploy on Render, Region: US (Oregon)
 // ============================================
 
 const express = require("express");
@@ -42,7 +42,7 @@ async function fetchUSProxies() {
 }
 
 // ============================================
-// GET WORKING US PROXY — STRICT
+// GET WORKING US PROXY
 // ============================================
 async function getWorkingProxy() {
   const now = Date.now();
@@ -51,27 +51,12 @@ async function getWorkingProxy() {
   }
 
   const proxies = await fetchUSProxies();
-  
-  // Filter: US country code, skip obvious datacenters first
-  const residential = proxies.filter(p => 
-    p.countryCode === "US" && 
-    !p.isp?.toLowerCase().includes("amazon") &&
-    !p.isp?.toLowerCase().includes("google") &&
-    !p.isp?.toLowerCase().includes("digitalocean") &&
-    !p.isp?.toLowerCase().includes("hetzner") &&
-    !p.isp?.toLowerCase().includes("oracle") &&
-    !p.isp?.toLowerCase().includes("alibaba") &&
-    !p.isp?.toLowerCase().includes("tencent")
-  );
-  
-  console.log(`🔍 Testing ${residential.length} residential + ${proxies.length - residential.length} datacenter proxies`);
+  const shuffled = proxies.filter(p => p.countryCode === "US").sort(() => Math.random() - 0.5);
 
-  const allProxies = [...residential.sort(() => Math.random() - 0.5), ...proxies.filter(p => p.countryCode === "US").sort(() => Math.random() - 0.5)];
-
-  for (const proxy of allProxies) {
+  for (const proxy of shuffled.slice(0, 20)) { // Only test first 20
     try {
       const agent = createAgent(proxy);
-      const testRes = await fetch("https://api.pluto.tv/v2/channels?channelType=live&limit=5", {
+      const testRes = await fetch("https://api.pluto.tv/v2/channels?channelType=live&limit=2", {
         agent,
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -79,31 +64,23 @@ async function getWorkingProxy() {
           "Origin": "https://pluto.tv",
           "Referer": "https://pluto.tv/",
         },
-        timeout: 8000,
+        timeout: 6000,
       });
 
       if (testRes.ok) {
         const data = await testRes.json();
         const channels = Array.isArray(data) ? data : data.data || [];
-        
-        // Check for non-European channel slugs
-        const usChannels = channels.filter(ch => {
-          const s = ch.slug || "";
-          return !s.includes("-de") && !s.includes("-gb") && !s.includes("-uk") && 
-                 !s.includes("-fr") && !s.includes("-es") && !s.includes("-it");
-        });
-
-        if (usChannels.length >= 3) {
+        if (channels.length > 0) {
           currentProxy = proxy;
           lastProxyRotate = now;
-          console.log(`✅ US: ${proxy.query}:${proxy.port} → ${usChannels[0]?.name} (${proxy.city})`);
+          console.log(`✅ Proxy: ${proxy.query}:${proxy.port} → ${channels[0]?.name}`);
           return proxy;
         }
       }
     } catch (e) {}
   }
 
-  console.log("❌ No US proxy found");
+  console.log("⚠️ No working proxy found, will use direct connection");
   return null;
 }
 
@@ -120,10 +97,9 @@ function createAgent(proxy) {
 }
 
 // ============================================
-// SMART FETCH
+// SMART FETCH — DIRECT FALLBACK
 // ============================================
 async function proxyFetch(url, options = {}) {
-  const proxy = await getWorkingProxy();
   const fetchOptions = {
     ...options,
     headers: {
@@ -135,7 +111,23 @@ async function proxyFetch(url, options = {}) {
     },
     timeout: 15000,
   };
-  if (proxy) fetchOptions.agent = createAgent(proxy);
+
+  // Try with proxy first
+  const proxy = await getWorkingProxy();
+  if (proxy) {
+    try {
+      fetchOptions.agent = createAgent(proxy);
+      const response = await fetch(url, fetchOptions);
+      if (response.ok) return response;
+      console.log(`⚠️ Proxy returned ${response.status}`);
+    } catch (e) {
+      console.log(`⚠️ Proxy ${proxy.query} failed: ${e.message}`);
+    }
+  }
+
+  // FALLBACK: Direct connection using Render's IP
+  console.log("🔄 Direct connection...");
+  delete fetchOptions.agent;
   return fetch(url, fetchOptions);
 }
 
@@ -178,16 +170,20 @@ function buildStreamUrl(channel) {
 // HEALTH
 // ============================================
 app.get("/health", async (req, res) => {
-  const proxy = await getWorkingProxy();
-  const proxies = await fetchUSProxies();
-  res.json({
-    status: "ok",
-    proxy: proxy ? `${proxy.query}:${proxy.port}` : "none",
-    proxyCity: proxy?.city || "unknown",
-    proxyRegion: proxy?.regionName || "unknown",
-    totalProxies: proxies.length,
-    uptime: process.uptime(),
-  });
+  try {
+    const testRes = await proxyFetch("https://api.pluto.tv/v2/channels?channelType=live&limit=1");
+    const data = await testRes.json();
+    const channels = Array.isArray(data) ? data : data.data || [];
+    res.json({
+      status: "ok",
+      plutoReachable: true,
+      sampleChannel: channels[0]?.name || "N/A",
+      sampleSlug: channels[0]?.slug || "N/A",
+      uptime: process.uptime(),
+    });
+  } catch (e) {
+    res.json({ status: "degraded", plutoReachable: false, error: e.message });
+  }
 });
 
 // ============================================
@@ -202,10 +198,8 @@ app.get("/channels", async (req, res) => {
       category: ch.category, description: ch.summary || "",
       thumbnail: ch.tile?.path || ch.thumbnail?.path || "",
       logo: ch.logo?.path || "",
-      isUS: !ch.slug?.includes("-de") && !ch.slug?.includes("-gb") && !ch.slug?.includes("-fr"),
     }));
-    const usChannels = channels.filter(c => c.isUS);
-    res.json({ total: channels.length, usChannels: usChannels.length, channels });
+    res.json({ total: channels.length, channels });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -223,15 +217,41 @@ app.get("/stream", async (req, res) => {
     const channels = Array.isArray(data) ? data : data.data || [];
     const ch = channels.find(c => c.slug === slug);
     if (!ch) return res.status(404).json({ error: "Channel not found" });
-    const streamUrl = buildStreamUrl(ch);
-    res.json({ channel: ch.name, slug: ch.slug, streamUrl, thumbnail: ch.tile?.path || "", logo: ch.logo?.path || "" });
+    res.json({
+      channel: ch.name, slug: ch.slug, number: ch.number,
+      streamUrl: buildStreamUrl(ch),
+      thumbnail: ch.tile?.path || "", logo: ch.logo?.path || "",
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
 // ============================================
-// 🎬 PLAY — STREAM PROXY
+// EPG
+// ============================================
+app.get("/epg", async (req, res) => {
+  try {
+    const response = await proxyFetch("https://api.pluto.tv/v2/channels?channelType=live");
+    const data = await response.json();
+    const channels = Array.isArray(data) ? data : data.data || [];
+    const programs = channels
+      .filter(ch => ch.currentBroadcast || ch.currentProgram)
+      .map(ch => {
+        const b = ch.currentBroadcast || ch.currentProgram || {};
+        return {
+          channelName: ch.name, channelSlug: ch.slug, channelNumber: ch.number,
+          title: b.title || "Unknown", startTime: b.start, endTime: b.stop,
+        };
+      });
+    res.json({ total: programs.length, programs });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================
+// 🎬 PLAY
 // ============================================
 app.get("/play", async (req, res) => {
   const slug = req.query.slug;
@@ -298,10 +318,19 @@ app.get("/play", async (req, res) => {
 });
 
 // ============================================
+// KEEP ALIVE
+// ============================================
+setInterval(() => {
+  fetch("https://api.pluto.tv/v2/channels?channelType=live&limit=1", {
+    headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" }
+  }).then(() => console.log("💓 Keep-alive")).catch(() => {});
+}, 10 * 60 * 1000);
+
+// ============================================
 // START
 // ============================================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`🚀 Pluto Proxy Relay v2 on port ${PORT}`);
+  console.log(`🚀 Pluto Relay v3 on port ${PORT}`);
   fetchUSProxies();
 });
