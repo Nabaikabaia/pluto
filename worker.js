@@ -1,5 +1,5 @@
 // ============================================
-// 🇺🇸 PLUTO TV API v3.4 — HEADER + PARAM FIX
+// 🇺🇸 PLUTO TV API v3.5 — WITH STREAM PROXY
 // Cloudflare Worker
 // ============================================
 
@@ -30,6 +30,7 @@ export default {
       "/epg": () => getEPG(),
       "/search": () => searchChannels(url.searchParams.get("q")),
       "/stream": () => getStreamUrl(url.searchParams),
+      "/play": () => proxyStream(url, request),
       "/boot": () => getBootData(),
       "/token": () => getToken(),
     };
@@ -106,6 +107,7 @@ async function getChannels() {
     logo: ch.logo?.path || ch.colorLogoPNG?.path || "",
     isStitched: ch.isStitched || false,
     streamUrl: `/stream?slug=${ch.slug}`,
+    playUrl: `/play?slug=${ch.slug}`,
     nowPlaying: ch.currentBroadcast?.title || ch.currentProgram?.title || null,
   }));
 
@@ -126,7 +128,7 @@ async function getToken() {
 }
 
 // ============================================
-// GET STREAM URL — TEST THE URL FROM WORKER
+// GET STREAM URL
 // ============================================
 async function getStreamUrl(params) {
   const slug = params.get("slug");
@@ -135,83 +137,144 @@ async function getStreamUrl(params) {
   const data = await plutoFetch("/v2/channels?channelType=live");
   const channels = Array.isArray(data) ? data : data.data || [];
   const channel = channels.find(ch => ch.slug === slug);
-
   if (!channel) return jsonResponse({ error: "Channel not found" }, 404);
 
-  const boot = await getBootDataFromCache();
-  const stitcher = boot.stitcher || "https://cfd-v4-service-channel-stitcher-use1-1.prd.pluto.tv";
-  
-  const deviceId = crypto.randomUUID();
-  const sessionId = crypto.randomUUID();
-  const clientTime = new Date().toISOString();
-
-  const queryParams = new URLSearchParams({
-    advertisingId: "",
-    appName: "web",
-    appVersion: "9.21.0-bf9f5b4369933742859f3b2581c935110922f642",
-    architecture: "",
-    buildVersion: "",
-    clientTime: clientTime,
-    deviceDNT: "false",
-    deviceId: deviceId,
-    deviceLat: "34.0522",
-    deviceLon: "-118.2437",
-    deviceMake: "chrome",
-    deviceModel: "web",
-    deviceType: "web",
-    deviceVersion: "148.0.7778",
-    includeExtendedEvents: "false",
-    marketingRegion: "US",
-    serverSideAds: "false",
-    sid: sessionId,
-    sessionID: sessionId,
-    userId: "",
-  });
-
-  const streamUrl = `${stitcher}/stitch/hls/channel/${channel._id}/master.m3u8?${queryParams.toString()}`;
-
-  // TEST: Actually fetch the m3u8 from the Worker
-  let testResult = null;
-  try {
-    const testResponse = await fetch(streamUrl, {
-      cf: { colo: "LAX" },
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-        "Accept": "*/*",
-        "Origin": "https://pluto.tv",
-        "Referer": "https://pluto.tv/",
-        "plutotv-device-dnt": "false",
-        "plutotv-device-model": "web",
-        "plutotv-device-make": "chrome",
-        "plutotv-device-type": "web",
-        "plutotv-device-version": "148.0.7778",
-        "plutotv-app-name": "web",
-        "plutotv-app-version": "9.21.0",
-      }
-    });
-    const responseText = await testResponse.text();
-    testResult = {
-      status: testResponse.status,
-      contentType: testResponse.headers.get("content-type"),
-      bodyStart: responseText.slice(0, 500),
-      isM3U8: responseText.startsWith("#EXTM3U"),
-    };
-  } catch (e) {
-    testResult = { error: e.message };
-  }
+  const streamUrl = buildStreamUrl(channel);
 
   return jsonResponse({
     channel: channel.name,
     slug: channel.slug,
     number: channel.number,
     streamUrl: streamUrl,
+    playUrl: `/play?slug=${channel.slug}`,
     thumbnail: channel.tile?.path || channel.thumbnail?.path || "",
     logo: channel.logo?.path || "",
     nowPlaying: channel.currentBroadcast?.title || channel.currentProgram?.title || null,
-    test: testResult,
-    note: testResult?.isM3U8 
-      ? "✅ STREAM WORKS! Copy streamUrl and open in VLC with US VPN." 
-      : "❌ Still blocked — see test result for error details"
+    note: "Use /play?slug=CHANNEL to proxy the stream through the Worker"
+  });
+}
+
+// ============================================
+// 🎬 STREAM PROXY — THE MAGIC
+// ============================================
+async function proxyStream(url, request) {
+  const slug = url.searchParams.get("slug");
+  const directUrl = url.searchParams.get("url");
+
+  // If proxying a specific .ts or .m3u8 file
+  if (directUrl) {
+    return proxyMediaFile(directUrl, request);
+  }
+
+  if (!slug) {
+    return jsonResponse({ error: "Missing ?slug=channel or ?url=direct-url" }, 400);
+  }
+
+  // Get channel and build master playlist URL
+  const data = await plutoFetch("/v2/channels?channelType=live");
+  const channels = Array.isArray(data) ? data : data.data || [];
+  const channel = channels.find(ch => ch.slug === slug);
+  if (!channel) return jsonResponse({ error: "Channel not found" }, 404);
+
+  const masterUrl = buildStreamUrl(channel);
+  const baseUrl = new URL(request.url).origin;
+
+  // Fetch master playlist from Worker (bypasses geolock)
+  const response = await fetch(masterUrl, {
+    cf: { colo: "LAX" },
+    headers: getStitcherHeaders(),
+  });
+
+  if (!response.ok) {
+    return new Response(`Failed to fetch stream: ${response.status}`, { status: response.status });
+  }
+
+  let playlist = await response.text();
+
+  // Rewrite ALL URLs to go through our proxy
+  playlist = playlist.replace(
+    /(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/gi,
+    (match) => `${baseUrl}/play?url=${encodeURIComponent(match)}`
+  );
+  playlist = playlist.replace(
+    /(https?:\/\/[^\s"'<>]+\.ts[^\s"'<>]*)/gi,
+    (match) => `${baseUrl}/play?url=${encodeURIComponent(match)}`
+  );
+  playlist = playlist.replace(
+    /(https?:\/\/[^\s"'<>]+\.key[^\s"'<>]*)/gi,
+    (match) => `${baseUrl}/play?url=${encodeURIComponent(match)}`
+  );
+
+  return new Response(playlist, {
+    headers: {
+      "Content-Type": "application/vnd.apple.mpegurl",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "no-cache",
+    }
+  });
+}
+
+// ============================================
+// PROXY INDIVIDUAL MEDIA FILES
+// ============================================
+async function proxyMediaFile(targetUrl, request) {
+  const response = await fetch(targetUrl, {
+    cf: { colo: "LAX" },
+    headers: getStitcherHeaders(),
+  });
+
+  if (!response.ok) {
+    return new Response(`Proxy error: ${response.status}`, { status: response.status });
+  }
+
+  const body = await response.arrayBuffer();
+  let contentType = response.headers.get("content-type") || "";
+
+  if (!contentType) {
+    if (targetUrl.includes(".m3u8")) contentType = "application/vnd.apple.mpegurl";
+    else if (targetUrl.includes(".ts")) contentType = "video/mp2t";
+    else if (targetUrl.includes(".key")) contentType = "application/octet-stream";
+    else contentType = "application/octet-stream";
+  }
+
+  // If it's a sub-playlist, rewrite URLs inside it too
+  if (targetUrl.includes(".m3u8") || contentType.includes("mpegurl")) {
+    const decoder = new TextDecoder();
+    let text = decoder.decode(body);
+    const baseUrl = new URL(request.url).origin;
+
+    text = text.replace(
+      /(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/gi,
+      (match) => `${baseUrl}/play?url=${encodeURIComponent(match)}`
+    );
+    text = text.replace(
+      /(https?:\/\/[^\s"'<>]+\.ts[^\s"'<>]*)/gi,
+      (match) => `${baseUrl}/play?url=${encodeURIComponent(match)}`
+    );
+    text = text.replace(
+      /(https?:\/\/[^\s"'<>]+\.key[^\s"'<>]*)/gi,
+      (match) => `${baseUrl}/play?url=${encodeURIComponent(match)}`
+    );
+
+    const encoder = new TextEncoder();
+    const rewritten = encoder.encode(text);
+    return new Response(rewritten, {
+      headers: {
+        "Content-Type": "application/vnd.apple.mpegurl",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-cache",
+        "Content-Length": rewritten.byteLength,
+      }
+    });
+  }
+
+  return new Response(body, {
+    headers: {
+      "Content-Type": contentType,
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=10",
+      "Content-Length": body.byteLength,
+    }
   });
 }
 
@@ -240,6 +303,7 @@ async function getChannel(params) {
       isStitched: ch.isStitched || false,
     },
     streamUrl: `/stream?slug=${ch.slug}`,
+    playUrl: `/play?slug=${ch.slug}`,
     nowPlaying: ch.currentBroadcast?.title || ch.currentProgram?.title || null,
   }, 200, 60);
 }
@@ -303,6 +367,7 @@ async function searchChannels(query) {
     thumbnail: ch.tile?.path || ch.thumbnail?.path || "",
     logo: ch.logo?.path || "",
     streamUrl: `/stream?slug=${ch.slug}`,
+    playUrl: `/play?slug=${ch.slug}`,
   }));
 
   return jsonResponse({ query, total: results.length, results }, 200, 120);
@@ -311,6 +376,54 @@ async function searchChannels(query) {
 // ============================================
 // INTERNAL HELPERS
 // ============================================
+function buildStreamUrl(channel) {
+  const stitcher = cachedBoot?.stitcher || "https://cfd-v4-service-channel-stitcher-use1-1.prd.pluto.tv";
+  const deviceId = crypto.randomUUID();
+  const sessionId = crypto.randomUUID();
+  const clientTime = new Date().toISOString();
+
+  const queryParams = new URLSearchParams({
+    advertisingId: "",
+    appName: "web",
+    appVersion: "9.21.0-bf9f5b4369933742859f3b2581c935110922f642",
+    architecture: "",
+    buildVersion: "",
+    clientTime: clientTime,
+    deviceDNT: "false",
+    deviceId: deviceId,
+    deviceLat: "34.0522",
+    deviceLon: "-118.2437",
+    deviceMake: "chrome",
+    deviceModel: "web",
+    deviceType: "web",
+    deviceVersion: "148.0.7778",
+    includeExtendedEvents: "false",
+    marketingRegion: "US",
+    serverSideAds: "false",
+    sid: sessionId,
+    sessionID: sessionId,
+    userId: "",
+  });
+
+  return `${stitcher}/stitch/hls/channel/${channel._id}/master.m3u8?${queryParams.toString()}`;
+}
+
+function getStitcherHeaders() {
+  return {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+    "Accept": "*/*",
+    "Origin": "https://pluto.tv",
+    "Referer": "https://pluto.tv/",
+    "plutotv-device-dnt": "false",
+    "plutotv-device-model": "web",
+    "plutotv-device-make": "chrome",
+    "plutotv-device-type": "web",
+    "plutotv-device-version": "148.0.7778",
+    "plutotv-app-name": "web",
+    "plutotv-app-version": "9.21.0",
+  };
+}
+
 async function getBootDataFromCache() {
   const now = Date.now();
   
@@ -364,7 +477,7 @@ async function plutoFetch(endpoint) {
 
 function apiDocs() {
   return jsonResponse({
-    service: "Pluto TV API v3.4",
+    service: "Pluto TV API v3.5 — WITH STREAM PROXY 🎬",
     endpoints: {
       "/boot": "Boot data — cached 7hrs",
       "/token": "JWT session token",
@@ -373,7 +486,12 @@ function apiDocs() {
       "/categories": "All categories",
       "/epg": "Program guide",
       "/search?q=comedy": "Search",
-      "/stream?slug=cnn": "Stream URL + test result",
+      "/stream?slug=cnn": "Get stream URL",
+      "/play?slug=cnn": "🎬 PROXY STREAM — Open in VLC!",
+    },
+    usage: {
+      vlc: "Media > Open Network Stream > https://YOUR_WORKER.workers.dev/play?slug=pluto-tv-movies-gb-1",
+      browser: "Use with hls.js player pointing to /play?slug=CHANNEL",
     }
   });
 }
