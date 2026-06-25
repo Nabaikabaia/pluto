@@ -1,5 +1,5 @@
 // ============================================
-// 🇺🇸 PLUTO TV API v3.6 — FULL
+// 🇺🇸 PLUTO TV API v3.7 — RELATIVE PATH FIX
 // Cloudflare Worker
 // ============================================
 
@@ -64,50 +64,83 @@ function watchPage(params) {
 <title>Pluto TV - ${slug}</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#000;display:flex;justify-content:center;align-items:center;height:100vh}
-video{width:100%;max-width:1280px;max-height:100vh}
+body{background:#000;display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column}
+video{width:100%;max-width:1280px;max-height:80vh}
 #status{color:#fff;font-family:monospace;font-size:18px;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
+#controls{margin-top:20px}
+a{color:#fff;background:#e50914;padding:12px 24px;border-radius:8px;text-decoration:none;font-family:monospace;font-size:16px;margin:0 10px}
 </style>
 </head>
 <body>
-<div id="status">🎬 Loading...</div>
+<div id="status">🎬 Loading stream...</div>
 <video id="v" controls autoplay playsinline style="display:none"></video>
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<div id="controls" style="margin-top:20px;display:none">
+  <a href="/">📺 More Channels</a>
+  <a href="/watch?slug=${slug}" style="background:#333">🔄 Reload</a>
+</div>
+
 <script>
-const v = document.getElementById('v');
-const s = document.getElementById('status');
-const url = '${origin}/play?slug=${slug}';
+(function() {
+  const v = document.getElementById('v');
+  const s = document.getElementById('status');
+  const c = document.getElementById('controls');
+  const url = '${origin}/play?slug=${slug}';
 
-function fail(msg) {
-  s.innerHTML = '❌ ' + msg + '<br><br><small>Try VLC: Media > Open Network Stream ><br>' + url + '</small>';
-}
+  function fail(msg) {
+    s.innerHTML = '❌ ' + msg + '<br><br><small>Try VLC:<br>Media > Open Network Stream ><br>' + url + '</small>';
+    c.style.display = 'block';
+  }
 
-if (Hls.isSupported()) {
-  const h = new Hls({ debug: false });
-  h.loadSource(url);
-  h.attachMedia(v);
-  h.on(Hls.Events.MANIFEST_PARSED, () => {
-    s.style.display = 'none';
-    v.style.display = 'block';
-    v.play().catch(() => { v.style.display = 'block'; s.style.display = 'none'; });
-  });
-  h.on(Hls.Events.ERROR, (e, d) => {
-    console.error('HLS:', d);
-    if (d.fatal) {
-      switch(d.type) {
-        case Hls.ErrorTypes.NETWORK_ERROR: fail('Network error - stream may be blocked'); break;
-        case Hls.ErrorTypes.MEDIA_ERROR: fail('Media error - retrying...'); h.recoverMediaError(); break;
-        default: fail('Stream error: ' + d.details); break;
-      }
-    }
-  });
-} else if (v.canPlayType('application/vnd.apple.mpegurl')) {
-  v.src = url;
-  v.addEventListener('loadedmetadata', () => { s.style.display = 'none'; v.style.display = 'block'; });
-  v.addEventListener('error', () => fail('Video load failed'));
-} else {
-  fail('Browser not supported. Use VLC or Chrome.');
-}
+  function loadHlsJS() {
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js';
+    script.onload = function() {
+      if (typeof Hls === 'undefined') { fail('hls.js failed'); return; }
+      
+      const h = new Hls({ 
+        debug: false,
+        manifestLoadPolicy: { default: { maxTimeToFirstByteMs: 15000, maxLoadTimeMs: 30000 } }
+      });
+      
+      h.loadSource(url);
+      h.attachMedia(v);
+      
+      h.on(Hls.Events.MANIFEST_PARSED, function() {
+        s.style.display = 'none';
+        v.style.display = 'block';
+        c.style.display = 'block';
+        v.play().catch(function() { s.style.display = 'none'; });
+      });
+      
+      h.on(Hls.Events.ERROR, function(event, data) {
+        console.error('HLS:', data.type, data.details);
+        if (data.fatal) {
+          switch(data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+              fail('Network error');
+              break;
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              h.recoverMediaError();
+              break;
+            default:
+              fail('Error: ' + data.details);
+              break;
+          }
+        }
+      });
+    };
+    script.onerror = function() { fail('Could not load hls.js'); };
+    document.head.appendChild(script);
+  }
+
+  if (v.canPlayType('application/vnd.apple.mpegurl')) {
+    v.src = url;
+    v.addEventListener('loadedmetadata', function() { s.style.display = 'none'; v.style.display = 'block'; c.style.display = 'block'; });
+    v.addEventListener('error', function() { fail('Video failed'); });
+  } else {
+    loadHlsJS();
+  }
+})();
 </script>
 </body>
 </html>`;
@@ -209,7 +242,7 @@ async function getStreamUrl(params) {
 }
 
 // ============================================
-// 🎬 STREAM PROXY
+// 🎬 STREAM PROXY — FIXED RELATIVE PATHS
 // ============================================
 async function proxyStream(url, request) {
   const slug = url.searchParams.get("slug");
@@ -230,6 +263,7 @@ async function proxyStream(url, request) {
 
   const masterUrl = buildStreamUrl(ch);
   const baseUrl = new URL(request.url).origin;
+  const masterBase = masterUrl.replace(/\/master\.m3u8.*$/, '');
 
   const response = await fetch(masterUrl, {
     cf: { colo: "LAX" },
@@ -241,9 +275,27 @@ async function proxyStream(url, request) {
   }
 
   let text = await response.text();
+
+  // Rewrite absolute URLs
   text = text.replace(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/gi, m => `${baseUrl}/play?url=${encodeURIComponent(m)}`);
   text = text.replace(/(https?:\/\/[^\s"'<>]+\.ts[^\s"'<>]*)/gi, m => `${baseUrl}/play?url=${encodeURIComponent(m)}`);
   text = text.replace(/(https?:\/\/[^\s"'<>]+\.key[^\s"'<>]*)/gi, m => `${baseUrl}/play?url=${encodeURIComponent(m)}`);
+
+  // Rewrite RELATIVE paths to sub-playlists (e.g. "1042180/playlist.m3u8?...")
+  text = text.replace(/^((?!https?:\/\/)(?!\#)[^\s"'<>]+\.m3u8[^\s"'<>]*)/gim,
+    (match) => {
+      const fullUrl = `${masterBase}/${match}`;
+      return `${baseUrl}/play?url=${encodeURIComponent(fullUrl)}`;
+    }
+  );
+
+  // Rewrite URI= attributes with relative paths
+  text = text.replace(/URI="((?!https?:\/\/)[^"]+)"/gi,
+    (match, path) => {
+      const fullUrl = `${masterBase}/${path}`;
+      return `URI="${baseUrl}/play?url=${encodeURIComponent(fullUrl)}"`;
+    }
+  );
 
   return new Response(text, {
     headers: {
@@ -255,7 +307,7 @@ async function proxyStream(url, request) {
 }
 
 // ============================================
-// PROXY MEDIA FILES
+// PROXY MEDIA FILES — FIXED RELATIVE PATHS
 // ============================================
 async function proxyMediaFile(targetUrl, request) {
   const response = await fetch(targetUrl, {
@@ -277,18 +329,57 @@ async function proxyMediaFile(targetUrl, request) {
 
   if (targetUrl.includes(".m3u8") || ct.includes("mpegurl")) {
     const baseUrl = new URL(request.url).origin;
+    const targetBase = targetUrl.replace(/\/[^\/]+\.m3u8.*$/, '');
+    
     let text = new TextDecoder().decode(body);
+
+    // Rewrite absolute URLs
     text = text.replace(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/gi, m => `${baseUrl}/play?url=${encodeURIComponent(m)}`);
     text = text.replace(/(https?:\/\/[^\s"'<>]+\.ts[^\s"'<>]*)/gi, m => `${baseUrl}/play?url=${encodeURIComponent(m)}`);
     text = text.replace(/(https?:\/\/[^\s"'<>]+\.key[^\s"'<>]*)/gi, m => `${baseUrl}/play?url=${encodeURIComponent(m)}`);
+
+    // Rewrite RELATIVE paths to sub-playlists
+    text = text.replace(/^((?!https?:\/\/)(?!\#)[^\s"'<>]+\.m3u8[^\s"'<>]*)/gim,
+      (match) => {
+        const fullUrl = `${targetBase}/${match}`;
+        return `${baseUrl}/play?url=${encodeURIComponent(fullUrl)}`;
+      }
+    );
+
+    // Rewrite RELATIVE .ts segments
+    text = text.replace(/^((?!https?:\/\/)(?!\#)[^\s"'<>]+\.ts[^\s"'<>]*)/gim,
+      (match) => {
+        const fullUrl = `${targetBase}/${match}`;
+        return `${baseUrl}/play?url=${encodeURIComponent(fullUrl)}`;
+      }
+    );
+
+    // Rewrite URI= attributes with relative paths
+    text = text.replace(/URI="((?!https?:\/\/)[^"]+)"/gi,
+      (match, path) => {
+        const fullUrl = `${targetBase}/${path}`;
+        return `URI="${baseUrl}/play?url=${encodeURIComponent(fullUrl)}"`;
+      }
+    );
+
     const enc = new TextEncoder().encode(text);
     return new Response(enc, {
-      headers: { "Content-Type": "application/vnd.apple.mpegurl", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-cache", "Content-Length": enc.byteLength }
+      headers: {
+        "Content-Type": "application/vnd.apple.mpegurl",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-cache",
+        "Content-Length": enc.byteLength
+      }
     });
   }
 
   return new Response(body, {
-    headers: { "Content-Type": ct, "Access-Control-Allow-Origin": "*", "Cache-Control": "public, max-age=10", "Content-Length": body.byteLength }
+    headers: {
+      "Content-Type": ct,
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=10",
+      "Content-Length": body.byteLength
+    }
   });
 }
 
@@ -395,7 +486,7 @@ async function plutoFetch(endpoint) {
 
 function apiDocs() {
   return jsonResponse({
-    service: "Pluto TV API v3.6 🎬",
+    service: "Pluto TV API v3.7 🎬",
     endpoints: {
       "/channels": "All live channels",
       "/channel?slug=cnn": "Channel details",
@@ -403,8 +494,8 @@ function apiDocs() {
       "/epg": "Program guide",
       "/search?q=comedy": "Search",
       "/stream?slug=cnn": "Stream URL",
-      "/play?slug=cnn": "Proxied m3u8 (for VLC)",
-      "/watch?slug=cnn": "🎬 Web player!",
+      "/play?slug=cnn": "Proxied m3u8 (VLC)",
+      "/watch?slug=cnn": "Web player",
       "/token": "JWT token",
       "/boot": "Boot data",
     }
