@@ -39,6 +39,64 @@ async function fetchUSProxies() {
 }
 
 // ============================================
+// 🆕 GET US SESSION TOKEN
+// ============================================
+let cachedToken = null;
+let cachedTokenTime = 0;
+const TOKEN_CACHE = 6 * 60 * 60 * 1000; // 6 hours
+
+app.get("/token", async (req, res) => {
+  try {
+    const now = Date.now();
+    
+    // Return cached token if still valid
+    if (cachedToken && (now - cachedTokenTime) < TOKEN_CACHE) {
+      return res.json({
+        source: "cache",
+        expiresIn: TOKEN_CACHE - (now - cachedTokenTime),
+        sessionToken: cachedToken.sessionToken,
+        stitcher: cachedToken.stitcher,
+        stitcherParams: cachedToken.stitcherParams,
+        session: cachedToken.session,
+      });
+    }
+
+    // Get fresh token from Pluto boot API
+    const clientID = uuidv4();
+    const timestamp = new Date().toISOString();
+    const bootUrl = `https://boot.pluto.tv/v4/start?appName=web&appVersion=9.21.0-bf9f5b4369933742859f3b2581c935110922f642&deviceVersion=148.0.7778&deviceModel=web&deviceMake=chrome&deviceType=web&clientID=${clientID}&clientModelNumber=1.0.0&serverSideAds=false&clientTime=${encodeURIComponent(timestamp)}`;
+
+    const response = await proxyFetch(bootUrl, {
+      headers: {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      }
+    });
+
+    const data = await response.json();
+
+    cachedToken = {
+      sessionToken: data.sessionToken,
+      stitcher: data.servers?.stitcher,
+      stitcherParams: data.stitcherParams,
+      session: data.session,
+    };
+    cachedTokenTime = now;
+
+    res.json({
+      source: "fresh",
+      expiresIn: TOKEN_CACHE,
+      sessionToken: data.sessionToken,
+      stitcher: data.servers?.stitcher,
+      stitcherParams: data.stitcherParams,
+      session: data.session,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ============================================
 // CREATE PROXY AGENT
 // ============================================
 function createAgent(proxy) {
