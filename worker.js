@@ -1,13 +1,12 @@
 // ============================================
-// 🇺🇸 PLUTO TV API v6.0 — RENDER TOKEN POWERED
-// Cloudflare Worker
+// 🇺🇸 PLUTO TV API v6.0 — RENDER US TOKEN
 // ============================================
 
 const RENDER_URL = "https://pluto-proxy.onrender.com";
 
 let cachedToken = null;
 let cachedTokenTime = 0;
-const TOKEN_CACHE = 5 * 60 * 60 * 1000; // 5 hours
+const TOKEN_CACHE = 5 * 60 * 60 * 1000;
 
 export default {
   async fetch(request) {
@@ -35,7 +34,6 @@ export default {
       "/play": () => proxyStream(url, request),
       "/watch": () => watchPage(url.searchParams),
       "/token": () => getToken(),
-      "/refresh": () => refreshToken(),
     };
 
     const handler = routes[path];
@@ -56,10 +54,7 @@ export default {
 // ============================================
 async function getUSToken() {
   const now = Date.now();
-  
-  if (cachedToken && (now - cachedTokenTime) < TOKEN_CACHE) {
-    return cachedToken;
-  }
+  if (cachedToken && (now - cachedTokenTime) < TOKEN_CACHE) return cachedToken;
 
   const response = await fetch(`${RENDER_URL}/token`);
   const data = await response.json();
@@ -68,35 +63,18 @@ async function getUSToken() {
     sessionToken: data.sessionToken,
     stitcher: data.stitcher,
     stitcherParams: data.stitcherParams,
-    country: data.session?.country || data.session?.activeRegion || "unknown",
+    country: data.session?.country || "US",
   };
   cachedTokenTime = now;
-  
-  console.log(`🇺🇸 Token from Render: ${cachedToken.country}`);
   return cachedToken;
 }
 
 // ============================================
-// REFRESH TOKEN
-// ============================================
-async function refreshToken() {
-  cachedToken = null;
-  cachedTokenTime = 0;
-  const token = await getUSToken();
-  return jsonResponse({ refreshed: true, country: token.country });
-}
-
-// ============================================
-// GET TOKEN
+// GET TOKEN INFO
 // ============================================
 async function getToken() {
   const token = await getUSToken();
-  return jsonResponse({
-    sessionToken: token.sessionToken,
-    stitcher: token.stitcher,
-    country: token.country,
-    expiresIn: TOKEN_CACHE,
-  });
+  return jsonResponse({ country: token.country, stitcher: token.stitcher, tokenPreview: token.sessionToken?.slice(0, 50) + "..." });
 }
 
 // ============================================
@@ -181,9 +159,9 @@ async function getStreamUrl(params) {
   const data = await plutoFetch("/v2/channels?channelType=live");
   const channels = Array.isArray(data) ? data : data.data || [];
   const ch = channels.find(c => c.slug === slug);
-  if (!ch) return jsonResponse({ error: "Channel not found" }, 404);
+  if (!ch) return jsonResponse({ error: "Not found" }, 404);
   const streamUrl = buildStreamUrl(ch);
-  return jsonResponse({ channel: ch.name, slug: ch.slug, streamUrl, playUrl: `/play?slug=${ch.slug}`, watchUrl: `/watch?slug=${ch.slug}` });
+  return jsonResponse({ channel: ch.name, slug: ch.slug, streamUrl, playUrl: `/play?slug=${ch.slug}` });
 }
 
 // ============================================
@@ -192,14 +170,13 @@ async function getStreamUrl(params) {
 async function proxyStream(url, request) {
   const slug = url.searchParams.get("slug");
   const directUrl = url.searchParams.get("url");
-
   if (directUrl) return proxyMediaFile(directUrl, request);
   if (!slug) return jsonResponse({ error: "Missing ?slug= or ?url=" }, 400);
 
   const data = await plutoFetch("/v2/channels?channelType=live");
   const channels = Array.isArray(data) ? data : data.data || [];
   const ch = channels.find(c => c.slug === slug);
-  if (!ch) return jsonResponse({ error: "Channel not found" }, 404);
+  if (!ch) return jsonResponse({ error: "Not found" }, 404);
 
   const masterUrl = buildStreamUrl(ch);
   const baseUrl = new URL(request.url).origin;
@@ -228,7 +205,6 @@ async function proxyMediaFile(targetUrl, request) {
     cf: { colo: "LAX" },
     headers: getStitcherHeaders(),
   });
-
   if (!response.ok) return new Response(`Error: ${response.status}`, { status: response.status });
 
   const body = await response.arrayBuffer();
@@ -277,13 +253,13 @@ a{color:#fff;background:#e50914;padding:12px 24px;border-radius:8px;text-decorat
 <body>
 <div id="s">🎬 Loading ${slug}...</div>
 <video id="v" controls autoplay playsinline style="display:none"></video>
-<div id="c"><a href="/channels">📺 More Channels</a><a href="/watch?slug=${slug}" style="background:#333">🔄 Reload</a></div>
+<div id="c"><a href="/channels">📺 Channels</a><a href="/watch?slug=${slug}" style="background:#333">🔄 Reload</a></div>
 <script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
 <script>
 const v=document.getElementById('v'),s=document.getElementById('s'),c=document.getElementById('c'),u='/play?slug=${slug}';
 function f(m){s.innerHTML='❌ '+m+'<br><small>VLC: '+u+'</small>';c.style.display='block'}
-if(Hls.isSupported()){const h=new Hls({debug:false});h.loadSource(u);h.attachMedia(v);h.on(Hls.Events.MANIFEST_PARSED,()=>{s.style.display='none';v.style.display='block';c.style.display='block';v.play().catch(()=>{})});h.on(Hls.Events.ERROR,(e,d)=>{console.error(d);if(d.fatal)f('Error: '+d.details)})}
-else if(v.canPlayType('application/vnd.apple.mpegurl')){v.src=u;v.addEventListener('loadedmetadata',()=>{s.style.display='none';v.style.display='block';c.style.display='block'});v.addEventListener('error',()=>f('Failed'))}
+if(Hls.isSupported()){const h=new Hls({debug:false,manifestLoadPolicy:{default:{maxTimeToFirstByteMs:20000,maxLoadTimeMs:40000}}});h.loadSource(u);h.attachMedia(v);h.on(Hls.Events.MANIFEST_PARSED,()=>{s.style.display='none';v.style.display='block';c.style.display='block';v.play().catch(()=>{})});h.on(Hls.Events.ERROR,(e,d)=>{console.error(d);if(d.fatal)f('Error: '+d.details)})}
+else if(v.canPlayType('application/vnd.apple.mpegurl')){v.src=u;v.addEventListener('loadedmetadata',()=>{s.style.display='none';v.style.display='block';c.style.display='block'})}
 else f('Use Chrome or VLC')
 </script>
 </body>
@@ -297,7 +273,6 @@ else f('Use Chrome or VLC')
 function buildStreamUrl(channel) {
   const token = cachedToken;
   const stitcher = token?.stitcher || "https://cfd-v4-service-channel-stitcher-use1-1.prd.pluto.tv";
-  const params = token?.stitcherParams || "";
   const deviceId = crypto.randomUUID();
   const sid = crypto.randomUUID();
   const ts = new Date().toISOString();
@@ -305,12 +280,11 @@ function buildStreamUrl(channel) {
   const q = new URLSearchParams({
     advertisingId: "", appName: "web", appVersion: "9.21.0-bf9f5b4369933742859f3b2581c935110922f642",
     architecture: "", buildVersion: "", clientTime: ts,
-    deviceDNT: "false", deviceId, deviceLat: "34.0522", deviceLon: "-118.2437",
+    deviceDNT: "false", deviceId, deviceLat: "34.3000", deviceLon: "-118.4200",
     deviceMake: "chrome", deviceModel: "web", deviceType: "web", deviceVersion: "148.0.7778",
     includeExtendedEvents: "false", marketingRegion: "US", serverSideAds: "false",
     sid, sessionID: sid, userId: "",
   });
-
   return `${stitcher}/stitch/hls/channel/${channel._id}/master.m3u8?${q.toString()}`;
 }
 
@@ -318,15 +292,10 @@ function getStitcherHeaders() {
   const token = cachedToken;
   return {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "*/*",
-    "Origin": "https://pluto.tv",
-    "Referer": "https://pluto.tv/",
-    "plutotv-device-dnt": "false",
-    "plutotv-device-model": "web",
-    "plutotv-device-make": "chrome",
-    "plutotv-device-type": "web",
-    "plutotv-device-version": "148.0.7778",
-    "plutotv-app-name": "web",
+    "Accept": "*/*", "Origin": "https://pluto.tv", "Referer": "https://pluto.tv/",
+    "plutotv-device-dnt": "false", "plutotv-device-model": "web",
+    "plutotv-device-make": "chrome", "plutotv-device-type": "web",
+    "plutotv-device-version": "148.0.7778", "plutotv-app-name": "web",
     "plutotv-app-version": "9.21.0",
     ...(token?.sessionToken ? { "Authorization": `Bearer ${token.sessionToken}` } : {}),
   };
@@ -351,7 +320,7 @@ async function plutoFetch(endpoint) {
 
 function apiDocs() {
   return jsonResponse({
-    service: "Pluto TV API v6.0 🇺🇸 — Render Token Powered",
+    service: "Pluto TV API v6.0 🇺🇸",
     endpoints: {
       "/channels": "All channels",
       "/channel?slug=cnn": "Channel details",
@@ -361,8 +330,7 @@ function apiDocs() {
       "/stream?slug=cnn": "Stream URL",
       "/play?slug=cnn": "🎬 Stream (VLC)",
       "/watch?slug=cnn": "🎬 Watch (Browser)",
-      "/token": "US session token",
-      "/refresh": "Force token refresh",
+      "/token": "Token info",
     }
   });
 }
