@@ -1,5 +1,5 @@
 // ============================================
-// PLUTO TV US API v2 — RENDER (COMPLETE + DEBUG)
+// PLUTO TV US API v3 — FINAL (DIRECT CDN)
 // Deploy on Render, Region: US (Oregon)
 // ============================================
 
@@ -78,13 +78,19 @@ function buildStreamUrl(id, jwt, sid, deviceId) {
   return `${STITCHER}/v2/stitch/hls/channel/${id}/master.m3u8?${q.toString()}`;
 }
 
+// Rewrite ONLY .m3u8 and .key — let .ts go DIRECT to CDN
 function rewritePlaylist(text, targetBase, baseUrl) {
+  // Proxy sub-m3u8 files
   text = text.replace(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi, m => `${baseUrl}/play?url=${encodeURIComponent(m)}`);
-  text = text.replace(/https?:\/\/[^\s"'<>]+\.ts[^\s"'<>]*/gi, m => `${baseUrl}/play?url=${encodeURIComponent(m)}`);
+  // Proxy .key files (small, need auth)
   text = text.replace(/https?:\/\/[^\s"'<>]+\.key[^\s"'<>]*/gi, m => `${baseUrl}/play?url=${encodeURIComponent(m)}`);
+  // DO NOT proxy .ts — they go directly to CBS Akamai CDN
+  
+  // Rewrite relative sub-m3u8 paths
   text = text.replace(/^(?!#)(?!https?:\/\/)[^\s"'<>]+\.m3u8[^\s"'<>]*/gim, m => `${baseUrl}/play?url=${encodeURIComponent(`${targetBase}/${m}`)}`);
-  text = text.replace(/^(?!#)(?!https?:\/\/)[^\s"'<>]+\.ts[^\s"'<>]*/gim, m => `${baseUrl}/play?url=${encodeURIComponent(`${targetBase}/${m}`)}`);
-  text = text.replace(/URI="(?!https?:\/\/)([^"]+)"/gi, (_, p) => `URI="${baseUrl}/play?url=${encodeURIComponent(`${targetBase}/${p}`)}"`);
+  // Rewrite relative .key paths in URI=
+  text = text.replace(/URI="(?!https?:\/\/)([^"]+\.key[^"]*)"/gi, (_, p) => `URI="${baseUrl}/play?url=${encodeURIComponent(`${targetBase}/${p}`)}"`);
+  
   return text;
 }
 
@@ -272,21 +278,19 @@ app.get("/stream", async (req, res) => {
 });
 
 // ============================================
-// 🎬 PLAY — STREAM PROXY
+// 🎬 PLAY — DIRECT CDN (.ts UNTOUCHED)
 // ============================================
 app.get("/play", async (req, res) => {
   try {
     const { id, slug, url: directUrl } = req.query;
     const baseUrl = getBaseUrl(req);
 
-    // Proxy direct URL (.m3u8, .ts, .key)
+    // Proxy direct URL (.m3u8 and .key — NOT .ts)
     if (directUrl) {
       const r = await fetch(directUrl, {
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
           "Accept": "*/*",
-          "Origin": "https://pluto.tv",
-          "Referer": "https://pluto.tv/",
         }
       });
       if (!r.ok) return res.status(r.status).send(`Error: ${r.status}`);
@@ -294,7 +298,7 @@ app.get("/play", async (req, res) => {
       const ct = r.headers.get("content-type") || "";
       const body = await r.buffer();
 
-      // Rewrite m3u8 playlists
+      // Rewrite m3u8 — proxy .key and sub-m3u8, let .ts go direct
       if (directUrl.includes(".m3u8") || ct.includes("mpegurl")) {
         let text = body.toString();
         const targetBase = directUrl.replace(/\/[^\/]+\.m3u8.*$/, "");
@@ -305,10 +309,10 @@ app.get("/play", async (req, res) => {
         return res.send(text);
       }
 
-      // Pass through .ts and .key files
+      // Pass through .key files
       res.set("Content-Type", ct || "application/octet-stream");
       res.set("Access-Control-Allow-Origin", "*");
-      res.set("Cache-Control", "public, max-age=10");
+      res.set("Cache-Control", "public, max-age=3600");
       return res.send(body);
     }
 
@@ -316,7 +320,6 @@ app.get("/play", async (req, res) => {
     if (!id && !slug) return res.status(400).json({ error: "Missing id, slug, or url" });
 
     const jwt = await getJWT();
-
     const r = await fetch(`${API}/v2/channels?channelType=live`, { headers: plutoHeaders() });
     const d = await r.json();
     const channels = Array.isArray(d) ? d : d.data || [];
@@ -330,8 +333,6 @@ app.get("/play", async (req, res) => {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "*/*",
-        "Origin": "https://pluto.tv",
-        "Referer": "https://pluto.tv/",
       }
     });
 
@@ -366,7 +367,7 @@ app.get("/debug-stream", async (req, res) => {
     const masterUrl = buildStreamUrl(ch._id, jwt.jwt, jwt.sessionID, jwt.deviceId);
     
     const mr = await fetch(masterUrl, {
-      headers: { "User-Agent": "Mozilla/5.0", "Accept": "*/*", "Origin": "https://pluto.tv" }
+      headers: { "User-Agent": "Mozilla/5.0", "Accept": "*/*" }
     });
     
     const masterText = await mr.text();
@@ -379,11 +380,11 @@ app.get("/debug-stream", async (req, res) => {
       const variantUrl = `${variantBase}/${variantMatch[0]}`;
       
       const vr = await fetch(variantUrl, {
-        headers: { "User-Agent": "Mozilla/5.0", "Accept": "*/*", "Origin": "https://pluto.tv" }
+        headers: { "User-Agent": "Mozilla/5.0", "Accept": "*/*" }
       });
       
       const variantText = await vr.text();
-      const tsMatch = variantText.match(/^(?!#)(?!https?:\/\/)[^\s"'<>]+\.ts[^\s"'<>]*/m);
+      const tsMatch = variantText.match(/https?:\/\/[^\s"'<>]+\.ts[^\s"'<>]*/);
       const keyMatch = variantText.match(/URI="([^"]+\.key[^"]*)"/);
       
       variantResult = {
@@ -474,7 +475,7 @@ if(Hls.isSupported()){
 app.get("/", (req, res) => {
   const baseUrl = getBaseUrl(req);
   res.json({
-    service: "Pluto TV US API v2 🇺🇸",
+    service: "Pluto TV US API v3 🇺🇸",
     baseUrl,
     endpoints: {
       health: `${baseUrl}/health`,
@@ -505,5 +506,5 @@ setInterval(() => {
 // ============================================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`🚀 Pluto US API v2 on port ${PORT}`);
+  console.log(`🚀 Pluto US API v3 on port ${PORT}`);
 });
