@@ -1,5 +1,5 @@
 // ============================================
-// PLUTO TV US API v2 — RENDER (COMPLETE)
+// PLUTO TV US API v2 — RENDER (COMPLETE + DEBUG)
 // Deploy on Render, Region: US (Oregon)
 // ============================================
 
@@ -350,6 +350,63 @@ app.get("/play", async (req, res) => {
 });
 
 // ============================================
+// 🔍 DEBUG STREAM
+// ============================================
+app.get("/debug-stream", async (req, res) => {
+  try {
+    const { id, slug } = req.query;
+    const jwt = await getJWT();
+    
+    const r = await fetch(`${API}/v2/channels?channelType=live`, { headers: plutoHeaders() });
+    const d = await r.json();
+    const channels = Array.isArray(d) ? d : d.data || [];
+    const ch = channels.find(c => c._id === id || c.slug === slug);
+    if (!ch) return res.json({ error: "Not found" });
+
+    const masterUrl = buildStreamUrl(ch._id, jwt.jwt, jwt.sessionID, jwt.deviceId);
+    
+    const mr = await fetch(masterUrl, {
+      headers: { "User-Agent": "Mozilla/5.0", "Accept": "*/*", "Origin": "https://pluto.tv" }
+    });
+    
+    const masterText = await mr.text();
+    
+    const variantMatch = masterText.match(/^(?!#)(?!https?:\/\/)[^\s"'<>]+\.m3u8[^\s"'<>]*/m);
+    let variantResult = null;
+    
+    if (variantMatch) {
+      const variantBase = masterUrl.replace(/\/master\.m3u8.*$/, "");
+      const variantUrl = `${variantBase}/${variantMatch[0]}`;
+      
+      const vr = await fetch(variantUrl, {
+        headers: { "User-Agent": "Mozilla/5.0", "Accept": "*/*", "Origin": "https://pluto.tv" }
+      });
+      
+      const variantText = await vr.text();
+      const tsMatch = variantText.match(/^(?!#)(?!https?:\/\/)[^\s"'<>]+\.ts[^\s"'<>]*/m);
+      const keyMatch = variantText.match(/URI="([^"]+\.key[^"]*)"/);
+      
+      variantResult = {
+        status: vr.status,
+        contentType: vr.headers.get("content-type"),
+        sampleTs: tsMatch ? tsMatch[0] : null,
+        sampleKey: keyMatch ? keyMatch[1] : null,
+        bodyStart: variantText.slice(0, 500),
+      };
+    }
+    
+    res.json({
+      channel: ch.name,
+      masterStatus: mr.status,
+      masterBodyStart: masterText.slice(0, 500),
+      variantResult,
+    });
+  } catch (e) {
+    res.json({ error: e.message });
+  }
+});
+
+// ============================================
 // 🎬 WATCH — WEB PLAYER
 // ============================================
 app.get("/watch", async (req, res) => {
@@ -429,6 +486,7 @@ app.get("/", (req, res) => {
       stream: `${baseUrl}/stream?id=ID`,
       play: `${baseUrl}/play?id=ID`,
       watch: `${baseUrl}/watch?slug=cnn-headlines`,
+      debugStream: `${baseUrl}/debug-stream?slug=cnn-headlines`,
     },
   });
 });
