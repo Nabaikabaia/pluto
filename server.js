@@ -1,5 +1,5 @@
 // ============================================
-// PLUTO TV US API v2 — RENDER (FINAL)
+// PLUTO TV US API v2 — RENDER (COMPLETE)
 // Deploy on Render, Region: US (Oregon)
 // ============================================
 
@@ -135,6 +135,7 @@ app.get("/channels", async (req, res) => {
       isUS: !ch.slug?.includes("-de") && !ch.slug?.includes("-gb") && !ch.slug?.includes("-fr") && !ch.slug?.includes("-es") && !ch.slug?.includes("-it"),
       streamUrl: `${baseUrl}/stream?id=${ch._id}`,
       playUrl: `${baseUrl}/play?id=${ch._id}`,
+      watchUrl: `${baseUrl}/watch?slug=${ch.slug}`,
     }));
 
     cache = channels;
@@ -166,6 +167,7 @@ app.get("/channel", async (req, res) => {
       thumbnail: ch.tile?.path || "", logo: ch.logo?.path || "",
       streamUrl: `${baseUrl}/stream?id=${ch._id}`,
       playUrl: `${baseUrl}/play?id=${ch._id}`,
+      watchUrl: `${baseUrl}/watch?slug=${ch.slug}`,
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -203,6 +205,7 @@ app.get("/epg", async (req, res) => {
         category: ch.category,
         streamUrl: `${baseUrl}/stream?id=${ch._id}`,
         playUrl: `${baseUrl}/play?id=${ch._id}`,
+        watchUrl: `${baseUrl}/watch?slug=${ch.slug}`,
       })),
     });
   } catch (e) {
@@ -230,6 +233,7 @@ app.get("/search", async (req, res) => {
         category: c.category, thumbnail: c.tile?.path || "",
         streamUrl: `${baseUrl}/stream?id=${c._id}`,
         playUrl: `${baseUrl}/play?id=${c._id}`,
+        watchUrl: `${baseUrl}/watch?slug=${c.slug}`,
       }));
 
     res.json({ query: q, total: results.length, results });
@@ -346,6 +350,68 @@ app.get("/play", async (req, res) => {
 });
 
 // ============================================
+// 🎬 WATCH — WEB PLAYER
+// ============================================
+app.get("/watch", async (req, res) => {
+  const { id, slug } = req.query;
+  const baseUrl = getBaseUrl(req);
+  const playUrl = id ? `${baseUrl}/play?id=${id}` : `${baseUrl}/play?slug=${slug || "cnn-headlines"}`;
+  const channelName = slug || id || "Pluto TV";
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pluto TV - ${channelName}</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;display:flex;justify-content:center;align-items:center;height:100vh;flex-direction:column}
+video{width:100%;max-width:1280px;max-height:80vh;background:#000}
+#status{color:#fff;font-family:monospace;font-size:18px;position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center}
+#controls{margin-top:20px;display:none}
+a{color:#fff;background:#e50914;padding:12px 24px;border-radius:8px;text-decoration:none;font-family:monospace;font-size:16px;margin:10px}
+</style>
+</head>
+<body>
+<div id="status">🎬 Loading...</div>
+<video id="v" controls autoplay playsinline style="display:none"></video>
+<div id="controls">
+  <a href="/channels">📺 Channels</a>
+  <a href="javascript:location.reload()" style="background:#333">🔄 Reload</a>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js"></script>
+<script>
+const v=document.getElementById('v'),s=document.getElementById('status'),c=document.getElementById('controls');
+const u="${playUrl}";
+
+function fail(msg) {
+  s.innerHTML='❌ '+msg+'<br><br><small>Try VLC:<br>Media > Open Network Stream ><br>${playUrl}</small>';
+  c.style.display='block';
+}
+
+if(Hls.isSupported()){
+  const h=new Hls({debug:false,manifestLoadPolicy:{default:{maxTimeToFirstByteMs:30000,maxLoadTimeMs:60000}}});
+  h.loadSource(u);
+  h.attachMedia(v);
+  h.on(Hls.Events.MANIFEST_PARSED,()=>{s.style.display='none';v.style.display='block';c.style.display='block';v.play().catch(()=>{})});
+  h.on(Hls.Events.ERROR,(e,d)=>{console.error('HLS:',d);if(d.fatal)f('Stream error: '+d.details)});
+} else if(v.canPlayType('application/vnd.apple.mpegurl')){
+  v.src=u;
+  v.addEventListener('loadedmetadata',()=>{s.style.display='none';v.style.display='block';c.style.display='block'});
+  v.addEventListener('error',()=>f('Video failed'));
+} else {
+  fail('Browser not supported. Use Chrome or VLC.');
+}
+</script>
+</body>
+</html>`;
+
+  res.set("Content-Type", "text/html");
+  res.send(html);
+});
+
+// ============================================
 // HOME
 // ============================================
 app.get("/", (req, res) => {
@@ -362,6 +428,7 @@ app.get("/", (req, res) => {
       search: `${baseUrl}/search?q=cnn`,
       stream: `${baseUrl}/stream?id=ID`,
       play: `${baseUrl}/play?id=ID`,
+      watch: `${baseUrl}/watch?slug=cnn-headlines`,
     },
   });
 });
